@@ -1,0 +1,445 @@
+<#
+.SYNOPSIS
+Complete McAfee Removal Script for NinjaRMM
+
+.DESCRIPTION
+Automated script to completely remove McAfee software from Windows systems.
+Designed for unattended execution via NinjaRMM.
+
+This script:
+- Detects McAfee installations in registry
+- Downloads and runs official McAfee removal tools
+- Uninstalls McAfee products using native uninstallers
+- Removes McAfee AppX packages
+- Cleans up leftover files, shortcuts, and registry keys
+- Runs silently with no user interaction
+- Does not trigger automatic reboots
+
+.NOTES
+  Version:        1.1.0
+  Author:         Based on Andrew Taylor's RemoveBloat.ps1
+  Creation Date:  11/20/2025
+  Modified:       11/20/2025
+  Purpose:        NinjaRMM automated McAfee removal
+  
+.EXAMPLE
+  .\Remove-McAfee.ps1
+  
+.EXAMPLE
+  powershell.exe -ExecutionPolicy Bypass -File "Remove-McAfee.ps1"
+#>
+
+[CmdletBinding()]
+param()
+
+#Requires -RunAsAdministrator
+
+############################################################################################################
+#                                         Initial Setup                                                    #
+############################################################################################################
+
+# Verify admin privileges (NinjaRMM should provide this)
+If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]'Administrator')) {
+    Write-Host "ERROR: This script requires administrator privileges." -ForegroundColor Red
+    Exit 1
+}
+
+# Setup logging
+$logPath = "C:\ProgramData\McAfeeRemoval"
+if (!(Test-Path $logPath)) {
+    New-Item -Path $logPath -ItemType Directory -Force | Out-Null
+}
+
+$logFile = Join-Path $logPath "McAfee-Removal-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+Start-Transcript -Path $logFile -Force
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "   McAfee Complete Removal Tool" -ForegroundColor Cyan
+Write-Host "   Version 1.1.0 (NinjaRMM)" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+
+############################################################################################################
+#                                         Detection Phase                                                  #
+############################################################################################################
+
+Write-Host "[1/6] Detecting McAfee installations..." -ForegroundColor Yellow
+
+$mcafeeInstalled = $false
+
+# Check 64-bit registry
+$installedSoftware = Get-ChildItem "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+foreach ($obj in $installedSoftware) {
+    $name = $obj.GetValue('DisplayName')
+    if ($name -like "*McAfee*") {
+        $mcafeeInstalled = $true
+        Write-Host "  Found: $name" -ForegroundColor Gray
+    }
+}
+
+# Check 32-bit registry
+$installedSoftware32 = Get-ChildItem "HKLM:\Software\WOW6432NODE\Microsoft\Windows\CurrentVersion\Uninstall"
+foreach ($obj32 in $installedSoftware32) {
+    $name32 = $obj32.GetValue('DisplayName')
+    if ($name32 -like "*McAfee*") {
+        $mcafeeInstalled = $true
+        Write-Host "  Found: $name32" -ForegroundColor Gray
+    }
+}
+
+if (!$mcafeeInstalled) {
+    Write-Host "  No McAfee installations detected." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Checking for AppX packages anyway..." -ForegroundColor Yellow
+    
+    # Still check for AppX packages
+    $mcafeeAppx = Get-AppxPackage -AllUsers | Where-Object { $_.Name -like "*McAfee*" }
+    if ($mcafeeAppx) {
+        Write-Host "  Found McAfee AppX packages. Proceeding with removal..." -ForegroundColor Yellow
+        $mcafeeInstalled = $true
+    }
+    else {
+        Write-Host ""
+        Write-Host "System is clean. No McAfee software found." -ForegroundColor Green
+        Write-Host "Script completed successfully." -ForegroundColor Green
+        Stop-Transcript
+        Exit 0
+    }
+}
+
+Write-Host ""
+Write-Host "McAfee detected! Beginning removal process..." -ForegroundColor Red
+Write-Host ""
+
+############################################################################################################
+#                                    Official McAfee Removal Tools                                         #
+############################################################################################################
+
+Write-Host "[2/6] Downloading and running official McAfee removal tools..." -ForegroundColor Yellow
+
+# Tool 1: McAfee Clean (Legacy)
+try {
+    Write-Host "  Downloading McAfee Cleanup Tool (v1)..." -ForegroundColor Gray
+    $url1 = 'https://github.com/andrew-s-taylor/public/raw/main/De-Bloat/mcafeeclean.zip'
+    $destination1 = Join-Path $logPath "mcafee.zip"
+    
+    Invoke-WebRequest -Uri $url1 -OutFile $destination1 -UseBasicParsing -ErrorAction Stop
+    Write-Host "  Download complete." -ForegroundColor Green
+    
+    Write-Host "  Extracting..." -ForegroundColor Gray
+    Expand-Archive $destination1 -DestinationPath $logPath -Force
+    
+    $cleanupExe = Join-Path $logPath "Mccleanup.exe"
+    if (Test-Path $cleanupExe) {
+        Write-Host "  Running McAfee Cleanup Tool (v1)..." -ForegroundColor Gray
+        $arguments = "-p StopServices,MFSY,PEF,MXD,CSP,Sustainability,MOCP,MFP,APPSTATS,Auth,EMproxy,FWdiver,HW,MAS,MAT,MBK,MCPR,McProxy,McSvcHost,VUL,MHN,MNA,MOBK,MPFP,MPFPCU,MPS,SHRED,MPSCU,MQC,MQCCU,MSAD,MSHR,MSK,MSKCU,MWL,NMC,RedirSvc,VS,REMEDIATION,MSC,YAP,TRUEKEY,LAM,PCB,Symlink,SafeConnect,MGS,WMIRemover,RESIDUEFWDRIVER,Redir,MSHR,WPS,MSSPlus -v -s"
+        try {
+            $process = Start-Process $cleanupExe -ArgumentList $arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+            $process | Wait-Process -Timeout 300 -ErrorAction Stop
+            Write-Host "  Cleanup tool (v1) completed." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  Warning: Cleanup tool v1 timed out or was blocked " -ForegroundColor Yellow
+            if ($process -and !$process.HasExited) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+catch {
+    Write-Host "  Warning: Could not download/run cleanup tool v1: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Tool 2: McAfee Clean (Updated)
+try {
+    Write-Host "  Downloading McAfee Cleanup Tool (v2)..." -ForegroundColor Gray
+    $url2 = 'https://github.com/andrew-s-taylor/public/raw/main/De-Bloat/mccleanup.zip'
+    $destination2 = Join-Path $logPath "mcafeenew.zip"
+    
+    Invoke-WebRequest -Uri $url2 -OutFile $destination2 -UseBasicParsing -ErrorAction Stop
+    Write-Host "  Download complete." -ForegroundColor Green
+    
+    $newPath = Join-Path $logPath "mcnew"
+    if (!(Test-Path $newPath)) {
+        New-Item -Path $newPath -ItemType Directory -Force | Out-Null
+    }
+    
+    Write-Host "  Extracting..." -ForegroundColor Gray
+    Expand-Archive $destination2 -DestinationPath $newPath -Force
+    
+    $cleanupExe2 = Join-Path $newPath "Mccleanup.exe"
+    if (Test-Path $cleanupExe2) {
+        Write-Host "  Running McAfee Cleanup Tool (v2)..." -ForegroundColor Gray
+        $arguments2 = "-p StopServices,MFSY,PEF,MXD,CSP,Sustainability,MOCP,MFP,APPSTATS,Auth,EMproxy,FWdiver,HW,MAS,MAT,MBK,MCPR,McProxy,McSvcHost,VUL,MHN,MNA,MOBK,MPFP,MPFPCU,MPS,SHRED,MPSCU,MQC,MQCCU,MSAD,MSHR,MSK,MSKCU,MWL,NMC,RedirSvc,VS,REMEDIATION,MSC,YAP,TRUEKEY,LAM,PCB,Symlink,SafeConnect,MGS,WMIRemover,RESIDUE -v -s"
+        try {
+            $process = Start-Process $cleanupExe2 -ArgumentList $arguments2 -WindowStyle Hidden -PassThru -ErrorAction Stop
+            $process | Wait-Process -Timeout 300 -ErrorAction Stop
+            Write-Host "  Cleanup tool (v2) completed." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  Warning: Cleanup tool v2 timed out or was blocked (may be ThreatLocker)" -ForegroundColor Yellow
+            if ($process -and !$process.HasExited) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+catch {
+    Write-Host "  Warning: Could not download/run cleanup tool v2: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+############################################################################################################
+#                                    Native Uninstaller Method                                             #
+############################################################################################################
+
+Write-Host "[3/6] Running native McAfee uninstallers..." -ForegroundColor Yellow
+
+# Build list of all uninstall strings
+$allUninstallStrings = @()
+
+# 64-bit programs
+$uninstall64 = Get-ChildItem "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue
+foreach ($item in $uninstall64) {
+    $props = Get-ItemProperty $item.PSPath -ErrorAction SilentlyContinue
+    if ($props.DisplayName -like "*McAfee*" -and $props.UninstallString) {
+        $allUninstallStrings += [PSCustomObject]@{
+            Name            = $props.DisplayName
+            UninstallString = $props.UninstallString
+        }
+    }
+}
+
+# 32-bit programs
+$uninstall32 = Get-ChildItem "HKLM:\Software\WOW6432NODE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue
+foreach ($item in $uninstall32) {
+    $props = Get-ItemProperty $item.PSPath -ErrorAction SilentlyContinue
+    if ($props.DisplayName -like "*McAfee*" -and $props.UninstallString) {
+        $allUninstallStrings += [PSCustomObject]@{
+            Name            = $props.DisplayName
+            UninstallString = $props.UninstallString
+        }
+    }
+}
+
+if ($allUninstallStrings.Count -gt 0) {
+    foreach ($program in $allUninstallStrings) {
+        Write-Host "  Uninstalling: $($program.Name)" -ForegroundColor Gray
+        $uninstallCmd = $program.UninstallString
+        
+        try {
+            if ($uninstallCmd -match "^msiexec") {
+                # MSI-based installer
+                $uninstallCmd = $uninstallCmd -replace "msiexec.exe", ""
+                $uninstallCmd = $uninstallCmd -replace "/I", "/X"
+                $uninstallCmd = $uninstallCmd.Trim() + " /quiet /norestart"
+                $process = Start-Process 'msiexec.exe' -ArgumentList $uninstallCmd -WindowStyle Hidden -PassThru -ErrorAction Stop
+                $process | Wait-Process -Timeout 180 -ErrorAction Stop
+            }
+            else {
+                # EXE-based installer - add silent flags if possible
+                $silentArgs = @('/S', '/silent', '/quiet', '-silent', '-quiet')
+                $cmdToRun = $uninstallCmd
+                # Check if uninstall string already has silent flags
+                $hasFlags = $false
+                foreach ($flag in $silentArgs) {
+                    if ($uninstallCmd -like "*$flag*") {
+                        $hasFlags = $true
+                        break
+                    }
+                }
+                # Add silent flag if not present
+                if (!$hasFlags) {
+                    $cmdToRun = "$uninstallCmd /S"
+                }
+                $process = Start-Process "cmd.exe" -ArgumentList "/c `"$cmdToRun`"" -WindowStyle Hidden -PassThru -ErrorAction Stop
+                $process | Wait-Process -Timeout 180 -ErrorAction Stop
+            }
+            Write-Host "    Success!" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Warning: Failed to uninstall or timed out" -ForegroundColor Yellow
+            if ($process -and !$process.HasExited) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+else {
+    Write-Host "  No native uninstallers found." -ForegroundColor Gray
+}
+
+Write-Host ""
+
+############################################################################################################
+#                                    McAfee Safe Connect Removal                                           #
+############################################################################################################
+
+Write-Host "[4/6] Removing McAfee Safe Connect..." -ForegroundColor Yellow
+
+$safeConnects = Get-ChildItem -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+Get-ItemProperty |
+Where-Object { $_.DisplayName -match "McAfee Safe Connect" } |
+Select-Object -Property UninstallString
+
+if ($safeConnects) {
+    foreach ($sc in $safeConnects) {
+        if ($sc.UninstallString) {
+            Write-Host "  Found Safe Connect. Uninstalling..." -ForegroundColor Gray
+            $uninstallCmd = "$($sc.UninstallString) /quiet /norestart"
+            try {
+                $process = Start-Process "cmd.exe" -ArgumentList "/c `"$uninstallCmd`"" -WindowStyle Hidden -PassThru -ErrorAction Stop
+                $process | Wait-Process -Timeout 180 -ErrorAction Stop
+                Write-Host "    Success!" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "    Warning: Safe Connect uninstall timed out or was blocked" -ForegroundColor Yellow
+                if ($process -and !$process.HasExited) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+}
+else {
+    Write-Host "  Safe Connect not found." -ForegroundColor Gray
+}
+
+Write-Host ""
+
+############################################################################################################
+#                                    AppX Package Removal                                                  #
+############################################################################################################
+
+Write-Host "[5/6] Removing McAfee AppX packages..." -ForegroundColor Yellow
+
+# Remove provisioned packages (for new users)
+$provisionedPackages = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+Where-Object { $_.DisplayName -like "*McAfee*" }
+
+foreach ($package in $provisionedPackages) {
+    Write-Host "  Removing provisioned package: $($package.DisplayName)" -ForegroundColor Gray
+    try {
+        Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -AllUsers -ErrorAction Stop
+        Write-Host "    Success!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "    Warning: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+# Remove installed packages (for current users)
+$installedPackages = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+Where-Object { $_.Name -like "*McAfee*" }
+
+foreach ($package in $installedPackages) {
+    Write-Host "  Removing installed package: $($package.Name)" -ForegroundColor Gray
+    try {
+        Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+        Write-Host "    Success!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "    Warning: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+if (!$provisionedPackages -and !$installedPackages) {
+    Write-Host "  No AppX packages found." -ForegroundColor Gray
+}
+
+Write-Host ""
+
+############################################################################################################
+#                                    Cleanup Leftover Files                                                #
+############################################################################################################
+
+Write-Host "[6/6] Cleaning up leftover files and registry entries..." -ForegroundColor Yellow
+
+# Remove Start Menu shortcuts
+$startMenuPath = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\McAfee"
+if (Test-Path $startMenuPath) {
+    Write-Host "  Removing Start Menu shortcuts..." -ForegroundColor Gray
+    Remove-Item -Path $startMenuPath -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "    Success!" -ForegroundColor Green
+}
+
+# Remove registry keys
+$regKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\McAfee.WPS"
+if (Test-Path $regKey) {
+    Write-Host "  Removing registry key: McAfee.WPS..." -ForegroundColor Gray
+    Remove-Item -Path $regKey -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "    Success!" -ForegroundColor Green
+}
+
+# Remove common McAfee program files directories
+$programFilesPaths = @(
+    "$env:ProgramFiles\McAfee",
+    "${env:ProgramFiles(x86)}\McAfee",
+    "$env:ProgramData\McAfee"
+)
+
+foreach ($path in $programFilesPaths) {
+    if (Test-Path $path) {
+        Write-Host "  Removing directory: $path" -ForegroundColor Gray
+        try {
+            Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+            Write-Host "    Success!" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Warning: Could not fully remove (may require reboot)" -ForegroundColor Yellow
+        }
+    }
+}
+
+# Clean up downloaded removal tools (keep log files)
+Write-Host "  Cleaning up temporary removal tool files..." -ForegroundColor Gray
+$filesToRemove = @(
+    (Join-Path $logPath "mcafee.zip"),
+    (Join-Path $logPath "mcafeenew.zip"),
+    (Join-Path $logPath "Mccleanup.exe"),
+    (Join-Path $logPath "mcnew")
+)
+
+foreach ($file in $filesToRemove) {
+    if (Test-Path $file) {
+        try {
+            Remove-Item -Path $file -Recurse -Force -ErrorAction Stop
+            Write-Host "    Removed: $file" -ForegroundColor Gray
+        }
+        catch {
+            Write-Host "    Warning: Could not remove $file" -ForegroundColor Yellow
+        }
+    }
+}
+
+Write-Host ""
+
+############################################################################################################
+#                                         Completion                                                       #
+############################################################################################################
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "   McAfee Removal Complete!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Summary:" -ForegroundColor White
+Write-Host "  - Official removal tools executed" -ForegroundColor Gray
+Write-Host "  - Native uninstallers run" -ForegroundColor Gray
+Write-Host "  - AppX packages removed" -ForegroundColor Gray
+Write-Host "  - Leftover files cleaned up" -ForegroundColor Gray
+Write-Host "  - Temporary tool files removed" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Log file saved to: $logFile" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "IMPORTANT: A system reboot is recommended to complete the removal." -ForegroundColor Yellow
+Write-Host "Schedule a reboot via NinjaRMM or notify the user to restart." -ForegroundColor Yellow
+Write-Host ""
+
+Stop-Transcript
+
+Write-Host "Script completed successfully." -ForegroundColor Green
+Exit 0
