@@ -1,0 +1,72 @@
+
+$TargetUser = "TARGET_USER"
+$LogFile = "C:\ProgramData\NinjaOne-Offboarding.log"
+
+function Write-Log {
+  $msg = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $($args[0])"
+  Add-Content -Path $LogFile -Value $msg
+  Write-Output $msg
+}
+
+Write-Log "=== Offboarding started for user: $TargetUser ==="
+
+# 1. Disable local user account
+try {
+  Disable-LocalUser -Name $TargetUser -ErrorAction Stop
+  Write-Log "Local user '$TargetUser' disabled."
+} catch {
+  Write-Log "WARN: Could not disable user or user not found."
+}
+
+# 2. Remove user profile
+try {
+  $profile = Get-CimInstance Win32_UserProfile | Where-Object {
+      $_.LocalPath -like "C:\Users\$TargetUser"
+  }
+
+    if ($profile) {
+      Remove-CimInstance $profile
+      Write-Log "User profile removed: C:\Users\$TargetUser"
+  } else {
+      Write-Log "No user profile found for $TargetUser"
+  }
+} catch {
+  Write-Log "ERROR removing user profile."
+}
+
+# 3. Clear cached credentials
+try {
+  cmdkey /list | ForEach-Object {
+      if ($_ -match "Target:") {
+          $cred = ($_ -replace "Target: ", "").Trim()
+          cmdkey /delete:$cred | Out-Null
+      }
+  }
+  Write-Log "Cached credentials cleared."
+} catch {
+  Write-Log "WARN: Failed to clear cached credentials."
+}
+
+# 4. Secure BitLocker (if enabled)
+try {
+  $bl = manage-bde -status C: | Select-String "Protection Status"
+  if ($bl -match "On") {
+      manage-bde -protectors -enable C: | Out-Null
+      Write-Log "BitLocker protection verified/enforced."
+  } else {
+      Write-Log "BitLocker not enabled."
+  }
+} catch {
+  Write-Log "WARN: BitLocker status unknown."
+}
+
+# 5. Rotate local Administrator password
+try {
+  $NewPass = [System.Web.Security.Membership]::GeneratePassword(20,3)
+  net user Administrator $NewPass | Out-Null
+  Write-Log "Local Administrator password rotated."
+} catch {
+  Write-Log "WARN: Failed to rotate Administrator password."
+}
+
+Write-Log "=== Offboarding completed successfully ==="
