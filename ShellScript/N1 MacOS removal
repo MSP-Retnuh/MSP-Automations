@@ -1,0 +1,137 @@
+#!/bin/bash
+
+Write-LogEntry() {
+    if [[ -z "$1" ]]; then
+        Write-LogEntry "Usage: Write-LogEntry \"You must supply a message when calling this function.\""
+        return 1
+    fi
+
+    local message="$1"
+
+    local log_path="/tmp/NinjaOneReinstall.log"
+    local timestamp
+    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+
+    # Append the log entry to the file and Write-LogEntry it to the console
+    echo "$timestamp - $message" >>"$log_path"
+    echo "$timestamp - $message"
+}
+
+## Begin Ninja Agent and Remote Removal
+if [[ $EUID -ne 0 ]]; then
+    Write-LogEntry "This script must be run as root. Try running it with sudo or as the system/root user."
+    exit 1
+fi
+
+LaunchDaemons=$(ls '/Library/LaunchDaemons' | grep 'ninjarmm')
+if [[ -z ${LaunchDaemons// /} ]]; then
+    Write-LogEntry 'No Launch Daemons found'
+else
+    for Daemon in $LaunchDaemons; do
+        Write-LogEntry "Removing $Daemon"
+        if [[ $Daemon =~ 'ncstreamer' ]]; then
+            Write-LogEntry 'Unloading Ninja Remote daemon...'
+            launchctl unload "$Daemon"
+        fi
+        rm -f "$Daemon"
+    done
+fi
+
+LaunchAgents=$(ls '/Library/LaunchAgents' | grep 'ninjarmm')
+if [[ -z ${LaunchAgents// /} ]]; then
+    Write-LogEntry 'No Launch Agents found'
+else
+    for Agent in $LaunchAgents; do
+        Write-LogEntry "Removing $Agent"
+        rm -f "$Agent"
+    done
+fi
+
+NinjaDir=/Applications/NinjaRMMAgent
+if [[ -d $NinjaDir ]]; then
+    Write-LogEntry "Removing $NinjaDir"
+    rm -rf $NinjaDir
+fi
+
+# Kill Ninja process last to prevent it from restarting
+NinjaProcesses=($(pgrep ninjarmm))
+if [[ ${#NinjaProcesses[@]} -gt 0 ]]; then
+    for NP in "${NinjaProcesses[@]}"; do
+        Write-LogEntry "Killing NinjaRMM process $NP"
+        kill -9 "$NP"
+    done
+    CheckRemaining=$(pgrep ninjarmm)
+    if [[ -z "$CheckRemaining" ]]; then
+        Write-LogEntry "Successfully killed all NinjaRMM processes."
+    else
+        Write-LogEntry "Not able to kill all NinjaRMM processes, aborting!"
+        Write-LogEntry "Remaining process(es): $CheckRemaining"
+    fi
+fi
+
+# Ninja Remote Cleanup
+NinjaRemoteProcess=($(pgrep ncstreamer))
+if [[ ${#NinjaRemoteProcess[@]} -gt 0 ]]; then
+    for NRP in "${NinjaRemoteProcess[@]}"; do
+        Write-LogEntry "Killing Ninja Remote process $NRP"
+        kill -9 "$NRP"
+    done
+    CheckRemaining=$(pgrep ncstreamer)
+    if [[ -z "$CheckRemaining" ]]; then
+        Write-LogEntry "Successfully killed all Ninja Remote processes."
+    else
+        Write-LogEntry "Not able to kill all Ninja Remote processes. Make sure there are no active NR sessions."
+        Write-LogEntry "Remaining process(es): $CheckRemaining"
+    fi
+fi
+
+SettingsPath='Library/Preferences'
+for UserPath in /Users/*; do
+    User=$(basename "$UserPath")
+    if [[ $User != 'Shared' ]]; then
+        FullPath="/Users/$User/$SettingsPath"
+        if [[ -d $FullPath ]]; then
+            NRSettingsFiles=$(ls "$FullPath" | grep 'ninjarmm')
+            if [[ ${NRSettingsFiles// /} ]]; then
+                for NRFile in $NRSettingsFiles; do
+                    Write-LogEntry "Removing $FullPath/$NRFile"
+                    rm -f "$FullPath/$NRFile"
+                done
+            fi
+        fi
+    fi
+done
+
+NRPrinter='/Library/Printers/NinjaRemote'
+if [[ -d "$NRPrinter" ]]; then
+    Write-LogEntry "Removing Ninja Remote printer at $NRPrinter"
+    rm -rf "$NRPrinter"
+fi
+
+NRPrinterBackend='/usr/libexec/cups/backend/nrprinter'
+if [[ -f "$NRPrinterBackend" ]]; then
+    Write-LogEntry "Removing Ninja Remote printer at $NRPrinterBackend"
+    rm -f "$NRPrinterBackend"
+fi
+
+if lpstat -p "NinjaRemote" >/dev/null 2>&1; then
+    Write-LogEntry 'Removing Ninja Remote printer from CUPS'
+    lpadmin -x NinjaRemote
+fi
+
+NRPShared='/Users/Shared/NrPdfPrint'
+if [[ -f $NRPShared ]]; then
+    Write-LogEntry 'Removing shared printer file'
+    rm -f "$NRPShared"
+fi
+
+NRDir='/Applications/NinjaRemote'
+if [[ -d $NRDir ]]; then
+    Write-LogEntry 'Removing Ninja Remote directory'
+    rm -rf "$NRDir"
+fi
+
+## End Ninja Agent and Remote Removal
+
+Write-LogEntry 'Removal completed. Please review output for any details'
+exit 0
