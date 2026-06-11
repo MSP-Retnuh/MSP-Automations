@@ -1,0 +1,27 @@
+# Bitwarden Extension Deployment Script
+# Imports a Powershell module that handles installation of the extension via the Chrome Web Store
+# JamesR 9-7-23 - Lightspeed Voice Engineering
+
+$extensionID= "nngceckbapebfimnlniiiahkandclblb";
+$downloadURL = "https://bitbucket.org/svalding/psbrowserextensions/raw/88b200bad8845acbb91d19fdc96cf9dee0303253/New-ChromeExtension.ps1";
+$tempPath = "C:\temp\BWinstall";
+$modulePath = "$tempPath\New-ChromeExtension.ps1";
+
+function TempPath
+{
+    if(Test-Path $tempPath)
+    {
+        Remove-Item "$tempPath\*";
+    }
+    else
+    {
+        New-Item $tempPath -ItemType Directory;
+    }
+}
+
+ Set-ExecutionPolicy RemoteSigned -Force
+ TempPath;
+ Invoke-RestMethod $downloadURL -OutFile $modulePath
+ Import-Module $modulePath
+ New-ChromeExtension -ExtensionID $extensionID -Hive Machine
+ 
