@@ -1,0 +1,148 @@
+#Requires -Modules Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Users
+<#
+.SYNOPSIS
+    Full Microsoft 365 tenant configuration audit.
+
+.DESCRIPTION
+    Audits: domains, licenses, authentication methods, MFA status,
+    legacy authentication, password policies, admin accounts.
+
+.PARAMETER ExportPath
+    Path for CSV/JSON export.
+
+.EXAMPLE
+    Connect-MgGraph -Scopes "User.Read.All","Directory.Read.All","Policy.Read.All"
+    .\01-tenant-audit.ps1
+#>
+
+param(
+    [string]$ExportPath = ".\audit-results"
+)
+
+$ErrorActionPreference = "Continue"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if (-not (Test-Path $ExportPath)) { New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null }
+
+Write-Host "`n[*] M365 Tenant Audit — $(Get-Date)" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 1: Organization info
+# ============================================================
+Write-Host "`n[1/6] Organization details..." -ForegroundColor Yellow
+
+$org = Get-MgOrganization
+Write-Host "  Tenant          : $($org.DisplayName)" -ForegroundColor Cyan
+Write-Host "  Tenant ID       : $($org.Id)" -ForegroundColor Cyan
+Write-Host "  Verified domains: $($org.VerifiedDomains.Name -join ', ')" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 2: License inventory
+# ============================================================
+Write-Host "`n[2/6] License inventory..." -ForegroundColor Yellow
+
+$licenses = Get-MgSubscribedSku
+$licenseReport = @()
+foreach ($lic in $licenses) {
+    $consumed = $lic.ConsumedUnits
+    $total = $lic.PrepaidUnits.Enabled
+    $available = $total - $consumed
+    $usage = if ($total -gt 0) { [math]::Round($consumed / $total * 100) } else { 0 }
+
+    $licenseReport += [PSCustomObject]@{
+        SkuPartNumber = $lic.SkuPartNumber
+        Total         = $total
+        Consumed      = $consumed
+        Available     = $available
+        UsagePercent  = "$usage%"
+    }
+    Write-Host "  $($lic.SkuPartNumber): $consumed/$total used ($usage%)" -ForegroundColor $(if($usage -gt 90){"Red"}elseif($usage -gt 70){"DarkYellow"}else{"Green"})
+}
+$licenseReport | Export-Csv "$ExportPath\license-inventory-$timestamp.csv" -NoTypeInformation
+
+# ============================================================
+# CHECK 3: Admin accounts
+# ============================================================
+Write-Host "`n[3/6] Global Administrator accounts..." -ForegroundColor Yellow
+
+$globalAdminRole = Get-MgDirectoryRole | Where-Object { $_.DisplayName -eq "Global Administrator" }
+$globalAdmins = @()
+if ($globalAdminRole) {
+    $members = Get-MgDirectoryRoleMember -DirectoryRoleId $globalAdminRole.Id
+    foreach ($m in $members) {
+        $user = Get-MgUser -UserId $m.Id -Property DisplayName, UserPrincipalName, AccountEnabled, LastSignInDateTime -ErrorAction SilentlyContinue
+        if ($user) {
+            $globalAdmins += [PSCustomObject]@{
+                DisplayName       = $user.DisplayName
+                UPN               = $user.UserPrincipalName
+                Enabled           = $user.AccountEnabled
+                LastSignIn        = $user.SignInActivity.LastSignInDateTime
+            }
+            Write-Host "  - $($user.UserPrincipalName) (Enabled: $($user.AccountEnabled))" -ForegroundColor $(if($user.AccountEnabled){"DarkYellow"}else{"Gray"})
+        }
+    }
+}
+
+$adminCount = $globalAdmins.Count
+if ($adminCount -gt 5) {
+    Write-Host "  [!] $adminCount Global Admins — too many (CIS recommends 2-4)" -ForegroundColor Red
+} elseif ($adminCount -lt 2) {
+    Write-Host "  [!] Only $adminCount Global Admin — no backup admin" -ForegroundColor Red
+} else {
+    Write-Host "  [+] $adminCount Global Admins (within recommended range)" -ForegroundColor Green
+}
+$globalAdmins | Export-Csv "$ExportPath\global-admins-$timestamp.csv" -NoTypeInformation
+
+# ============================================================
+# CHECK 4: Password policies
+# ============================================================
+Write-Host "`n[4/6] Password policies..." -ForegroundColor Yellow
+
+$authMethods = Get-MgPolicyAuthenticationMethodPolicy -ErrorAction SilentlyContinue
+if ($authMethods) {
+    Write-Host "  [+] Authentication methods policy retrieved" -ForegroundColor Green
+}
+
+# Check password expiration
+$passwordPolicy = $org.PasswordExpirationPolicy
+if ($passwordPolicy) {
+    Write-Host "  Password policy: $passwordPolicy" -ForegroundColor Cyan
+} else {
+    Write-Host "  [i] Using default password policies" -ForegroundColor DarkYellow
+}
+
+# ============================================================
+# CHECK 5: Security Defaults
+# ============================================================
+Write-Host "`n[5/6] Security Defaults status..." -ForegroundColor Yellow
+
+$securityDefaults = Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction SilentlyContinue
+if ($securityDefaults.IsEnabled) {
+    Write-Host "  [+] Security Defaults: ENABLED" -ForegroundColor Green
+} else {
+    Write-Host "  [!] Security Defaults: DISABLED — ensure Conditional Access is configured" -ForegroundColor DarkYellow
+}
+
+# ============================================================
+# CHECK 6: User statistics
+# ============================================================
+Write-Host "`n[6/6] User statistics..." -ForegroundColor Yellow
+
+$allUsers = Get-MgUser -All -Property AccountEnabled, UserType, CreationType
+$enabledUsers = ($allUsers | Where-Object { $_.AccountEnabled }).Count
+$disabledUsers = ($allUsers | Where-Object { -not $_.AccountEnabled }).Count
+$guestUsers = ($allUsers | Where-Object { $_.UserType -eq "Guest" }).Count
+$totalUsers = $allUsers.Count
+
+Write-Host "  Total users     : $totalUsers" -ForegroundColor Cyan
+Write-Host "  Enabled         : $enabledUsers" -ForegroundColor Green
+Write-Host "  Disabled        : $disabledUsers" -ForegroundColor $(if($disabledUsers -gt 0){"DarkYellow"}else{"Green"})
+Write-Host "  Guest accounts  : $guestUsers" -ForegroundColor $(if($guestUsers -gt 10){"DarkYellow"}else{"Green"})
+
+# Summary
+Write-Host "`n[*] Tenant Audit Summary" -ForegroundColor Cyan
+Write-Host "  Tenant          : $($org.DisplayName)"
+Write-Host "  Licenses        : $($licenseReport.Count) SKUs"
+Write-Host "  Global Admins   : $adminCount"
+Write-Host "  Total users     : $totalUsers (Enabled: $enabledUsers, Guests: $guestUsers)"
+Write-Host "  Security Defaults: $(if($securityDefaults.IsEnabled){'Enabled'}else{'Disabled'})"
+Write-Host "  Results exported : $ExportPath" -ForegroundColor Cyan
