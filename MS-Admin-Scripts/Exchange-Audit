@@ -1,0 +1,159 @@
+#Requires -Modules ExchangeOnlineManagement
+<#
+.SYNOPSIS
+    Audit Exchange Online: mailboxes, forwarding rules, delegates, shared boxes.
+
+.DESCRIPTION
+    Detects data exfiltration vectors: external forwarding, suspicious inbox rules,
+    full access delegates on sensitive mailboxes.
+    
+    CIS M365 Benchmark: 2.1.1 — Ensure mail transport rules do not forward email externally
+
+.PARAMETER ExportPath
+    Path for CSV export.
+
+.EXAMPLE
+    Connect-ExchangeOnline
+    .\02-exchange-audit.ps1
+#>
+
+param(
+    [string]$ExportPath = ".\audit-results"
+)
+
+$ErrorActionPreference = "Continue"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if (-not (Test-Path $ExportPath)) { New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null }
+
+Write-Host "`n[*] Exchange Online Audit — $(Get-Date)" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 1: Mailbox inventory
+# ============================================================
+Write-Host "`n[1/5] Mailbox inventory..." -ForegroundColor Yellow
+
+$mailboxes = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName, PrimarySmtpAddress, RecipientTypeDetails, IsShared
+$userMailboxes = $mailboxes | Where-Object { $_.RecipientTypeDetails -eq "UserMailbox" }
+$sharedMailboxes = $mailboxes | Where-Object { $_.RecipientTypeDetails -eq "SharedMailbox" }
+$roomMailboxes = $mailboxes | Where-Object { $_.RecipientTypeDetails -eq "RoomMailbox" }
+
+Write-Host "  User mailboxes   : $($userMailboxes.Count)" -ForegroundColor Cyan
+Write-Host "  Shared mailboxes : $($sharedMailboxes.Count)" -ForegroundColor Cyan
+Write-Host "  Room mailboxes   : $($roomMailboxes.Count)" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 2: External forwarding
+# ============================================================
+Write-Host "`n[2/5] External mail forwarding..." -ForegroundColor Yellow
+
+$forwardingMailboxes = @()
+foreach ($mbx in $mailboxes) {
+    $fwd = Get-EXOMailbox -Identity $mbx.PrimarySmtpAddress -Properties ForwardingSmtpAddress, ForwardingAddress, DeliverToMailboxAndForward -ErrorAction SilentlyContinue
+    if ($fwd.ForwardingSmtpAddress -or $fwd.ForwardingAddress) {
+        $forwardingMailboxes += [PSCustomObject]@{
+            Mailbox              = $fwd.PrimarySmtpAddress
+            ForwardingSmtp       = $fwd.ForwardingSmtpAddress
+            ForwardingAddress    = $fwd.ForwardingAddress
+            DeliverAndForward    = $fwd.DeliverToMailboxAndForward
+        }
+        $isExternal = $fwd.ForwardingSmtpAddress -and $fwd.ForwardingSmtpAddress -notmatch (Get-AcceptedDomain).DomainName
+        Write-Host "  [!] $($fwd.PrimarySmtpAddress) forwards to $($fwd.ForwardingSmtpAddress)$(if($isExternal){' (EXTERNAL)'})" -ForegroundColor $(if($isExternal){"Red"}else{"DarkYellow"})
+    }
+}
+
+if ($forwardingMailboxes.Count -eq 0) {
+    Write-Host "  [+] No mailbox forwarding configured." -ForegroundColor Green
+} else {
+    Write-Host "  [!] $($forwardingMailboxes.Count) mailboxes with forwarding" -ForegroundColor Red
+    $forwardingMailboxes | Export-Csv "$ExportPath\mail-forwarding-$timestamp.csv" -NoTypeInformation
+}
+
+# ============================================================
+# CHECK 3: Suspicious inbox rules
+# ============================================================
+Write-Host "`n[3/5] Suspicious inbox rules (external forward, delete, move)..." -ForegroundColor Yellow
+
+$suspiciousRules = @()
+foreach ($mbx in $userMailboxes | Select-Object -First 100) {
+    $rules = Get-InboxRule -Mailbox $mbx.PrimarySmtpAddress -ErrorAction SilentlyContinue
+    foreach ($rule in $rules) {
+        $isSuspicious = $false
+        $reason = ""
+
+        if ($rule.ForwardTo -or $rule.ForwardAsAttachmentTo -or $rule.RedirectTo) {
+            $isSuspicious = $true
+            $reason = "Forwards/redirects to: $($rule.ForwardTo)$($rule.ForwardAsAttachmentTo)$($rule.RedirectTo)"
+        }
+        if ($rule.DeleteMessage -eq $true) {
+            $isSuspicious = $true
+            $reason += " Deletes messages."
+        }
+        if ($rule.MoveToFolder -match "RSS|Deleted|Junk" -and $rule.From) {
+            $isSuspicious = $true
+            $reason += " Moves specific sender to $($rule.MoveToFolder)."
+        }
+
+        if ($isSuspicious) {
+            $suspiciousRules += [PSCustomObject]@{
+                Mailbox  = $mbx.PrimarySmtpAddress
+                RuleName = $rule.Name
+                Enabled  = $rule.Enabled
+                Reason   = $reason
+            }
+            Write-Host "  [!] $($mbx.PrimarySmtpAddress) — Rule '$($rule.Name)': $reason" -ForegroundColor Red
+        }
+    }
+}
+
+if ($suspiciousRules.Count -eq 0) {
+    Write-Host "  [+] No suspicious inbox rules found." -ForegroundColor Green
+} else {
+    $suspiciousRules | Export-Csv "$ExportPath\suspicious-inbox-rules-$timestamp.csv" -NoTypeInformation
+}
+
+# ============================================================
+# CHECK 4: Transport rules
+# ============================================================
+Write-Host "`n[4/5] Transport rules audit..." -ForegroundColor Yellow
+
+$transportRules = Get-TransportRule -ErrorAction SilentlyContinue
+$externalRules = @()
+foreach ($rule in $transportRules) {
+    if ($rule.State -eq "Enabled" -and ($rule.RouteMessageOutboundRequireTls -or $rule.RedirectMessageTo -or $rule.BlindCopyTo)) {
+        $externalRules += [PSCustomObject]@{
+            Name     = $rule.Name
+            State    = $rule.State
+            Priority = $rule.Priority
+            Action   = $(if($rule.RedirectMessageTo){"Redirect: $($rule.RedirectMessageTo)"}elseif($rule.BlindCopyTo){"BCC: $($rule.BlindCopyTo)"}else{"TLS Required"})
+        }
+        Write-Host "  [i] Rule '$($rule.Name)' — $($externalRules[-1].Action)" -ForegroundColor DarkYellow
+    }
+}
+
+Write-Host "  Total transport rules: $($transportRules.Count)" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 5: Shared mailbox sign-in
+# ============================================================
+Write-Host "`n[5/5] Shared mailboxes with direct sign-in enabled..." -ForegroundColor Yellow
+
+$sharedSignIn = @()
+foreach ($shared in $sharedMailboxes) {
+    $user = Get-MgUser -UserId $shared.ExternalDirectoryObjectId -Property AccountEnabled -ErrorAction SilentlyContinue
+    if ($user.AccountEnabled) {
+        $sharedSignIn += $shared.PrimarySmtpAddress
+        Write-Host "  [!] $($shared.PrimarySmtpAddress) — direct sign-in ENABLED (should be disabled)" -ForegroundColor Red
+    }
+}
+
+if ($sharedSignIn.Count -eq 0) {
+    Write-Host "  [+] All shared mailboxes have direct sign-in disabled." -ForegroundColor Green
+}
+
+# Summary
+Write-Host "`n[*] Exchange Audit Summary" -ForegroundColor Cyan
+Write-Host "  Total mailboxes       : $($mailboxes.Count)"
+Write-Host "  Forwarding configured : $($forwardingMailboxes.Count)"
+Write-Host "  Suspicious rules      : $($suspiciousRules.Count)"
+Write-Host "  Shared with sign-in   : $($sharedSignIn.Count)"
+Write-Host "  Results exported to   : $ExportPath" -ForegroundColor Cyan
