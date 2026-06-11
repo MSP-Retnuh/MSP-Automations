@@ -1,0 +1,3 @@
+curl https://scripts-bpc.s3.amazonaws.com/snap-mac-uninstall.sh | sh
+sudo sh snap-mac-uninstall.sh
+sudo rm -rf /etc/snap-agent
