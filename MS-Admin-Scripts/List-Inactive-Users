@@ -1,0 +1,149 @@
+#Requires -Modules Microsoft.Graph.Users
+<#
+.SYNOPSIS
+    Detect inactive users and stale guest accounts in M365.
+
+.DESCRIPTION
+    Identifies: users with no sign-in > 90 days, disabled accounts with licenses,
+    stale guest accounts, accounts never signed in.
+    
+    CIS M365 Benchmark: 1.1.4 — Ensure unused accounts are disabled
+
+.PARAMETER InactiveDays
+    Number of days without sign-in to flag as inactive. Default: 90.
+
+.PARAMETER ExportPath
+    Path for CSV export.
+
+.EXAMPLE
+    Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All"
+    .\08-inactive-users.ps1
+    .\08-inactive-users.ps1 -InactiveDays 60
+#>
+
+param(
+    [int]$InactiveDays = 90,
+    [string]$ExportPath = ".\audit-results"
+)
+
+$ErrorActionPreference = "Continue"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if (-not (Test-Path $ExportPath)) { New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null }
+$cutoffDate = (Get-Date).AddDays(-$InactiveDays)
+
+Write-Host "`n[*] Inactive Users Audit — $(Get-Date)" -ForegroundColor Cyan
+Write-Host "[*] Inactive threshold: $InactiveDays days (before $($cutoffDate.ToString('yyyy-MM-dd')))" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 1: Inactive users (no sign-in > threshold)
+# ============================================================
+Write-Host "`n[1/4] Users with no sign-in in $InactiveDays days..." -ForegroundColor Yellow
+
+$allUsers = Get-MgUser -All -Property DisplayName, UserPrincipalName, AccountEnabled, UserType, SignInActivity, AssignedLicenses, CreatedDateTime
+
+$inactiveUsers = @()
+$neverSignedIn = @()
+
+foreach ($user in $allUsers) {
+    $lastSignIn = $user.SignInActivity.LastSignInDateTime
+    
+    if (-not $lastSignIn -and $user.AccountEnabled) {
+        $neverSignedIn += [PSCustomObject]@{
+            DisplayName = $user.DisplayName
+            UPN         = $user.UserPrincipalName
+            UserType    = $user.UserType
+            Created     = $user.CreatedDateTime
+            Licensed    = ($user.AssignedLicenses.Count -gt 0)
+        }
+    }
+    elseif ($lastSignIn -and $lastSignIn -lt $cutoffDate -and $user.AccountEnabled) {
+        $daysSince = ((Get-Date) - $lastSignIn).Days
+        $inactiveUsers += [PSCustomObject]@{
+            DisplayName  = $user.DisplayName
+            UPN          = $user.UserPrincipalName
+            UserType     = $user.UserType
+            LastSignIn   = $lastSignIn
+            DaysInactive = $daysSince
+            Licensed     = ($user.AssignedLicenses.Count -gt 0)
+        }
+    }
+}
+
+Write-Host "  [!] $($inactiveUsers.Count) inactive users (>$InactiveDays days)" -ForegroundColor $(if($inactiveUsers.Count -gt 0){"Red"}else{"Green"})
+Write-Host "  [!] $($neverSignedIn.Count) enabled users never signed in" -ForegroundColor $(if($neverSignedIn.Count -gt 0){"DarkYellow"}else{"Green"})
+
+if ($inactiveUsers.Count -gt 0) {
+    foreach ($u in $inactiveUsers | Sort-Object DaysInactive -Descending | Select-Object -First 15) {
+        Write-Host "    - $($u.UPN) — $($u.DaysInactive) days inactive$(if($u.Licensed){' [LICENSED]'})" -ForegroundColor Red
+    }
+    $inactiveUsers | Export-Csv "$ExportPath\inactive-users-$timestamp.csv" -NoTypeInformation
+}
+
+# ============================================================
+# CHECK 2: Stale guest accounts
+# ============================================================
+Write-Host "`n[2/4] Stale guest accounts..." -ForegroundColor Yellow
+
+$guests = $allUsers | Where-Object { $_.UserType -eq "Guest" }
+$staleGuests = @()
+
+foreach ($guest in $guests) {
+    $lastSignIn = $guest.SignInActivity.LastSignInDateTime
+    if (-not $lastSignIn -or $lastSignIn -lt $cutoffDate) {
+        $staleGuests += [PSCustomObject]@{
+            DisplayName = $guest.DisplayName
+            UPN         = $guest.UserPrincipalName
+            LastSignIn  = $lastSignIn
+            Created     = $guest.CreatedDateTime
+        }
+    }
+}
+
+Write-Host "  Total guests        : $($guests.Count)" -ForegroundColor Cyan
+Write-Host "  Stale guests (>$InactiveDays d) : $($staleGuests.Count)" -ForegroundColor $(if($staleGuests.Count -gt 0){"Red"}else{"Green"})
+
+if ($staleGuests.Count -gt 0) {
+    $staleGuests | Export-Csv "$ExportPath\stale-guests-$timestamp.csv" -NoTypeInformation
+}
+
+# ============================================================
+# CHECK 3: Disabled users with licenses
+# ============================================================
+Write-Host "`n[3/4] Disabled users still consuming licenses..." -ForegroundColor Yellow
+
+$disabledLicensed = $allUsers | Where-Object {
+    -not $_.AccountEnabled -and $_.AssignedLicenses.Count -gt 0
+}
+
+if ($disabledLicensed) {
+    Write-Host "  [!] $($disabledLicensed.Count) disabled users with active licenses:" -ForegroundColor Red
+    foreach ($d in $disabledLicensed | Select-Object -First 10) {
+        Write-Host "    - $($d.UserPrincipalName) ($($d.AssignedLicenses.Count) licenses)" -ForegroundColor Red
+    }
+    $disabledLicensed | Select-Object DisplayName, UserPrincipalName, @{N='LicenseCount';E={$_.AssignedLicenses.Count}} |
+        Export-Csv "$ExportPath\disabled-with-licenses-$timestamp.csv" -NoTypeInformation
+} else {
+    Write-Host "  [+] No disabled users consuming licenses." -ForegroundColor Green
+}
+
+# ============================================================
+# CHECK 4: License waste estimation
+# ============================================================
+Write-Host "`n[4/4] License cost estimation..." -ForegroundColor Yellow
+
+$wastedLicenses = 0
+if ($disabledLicensed) { $wastedLicenses += ($disabledLicensed | Measure-Object).Count }
+if ($inactiveUsers) { $wastedLicenses += ($inactiveUsers | Where-Object { $_.Licensed } | Measure-Object).Count }
+
+$estimatedWaste = $wastedLicenses * 12  # Rough estimate ~12 EUR/user/month
+Write-Host "  Estimated wasted licenses : $wastedLicenses" -ForegroundColor $(if($wastedLicenses -gt 0){"Red"}else{"Green"})
+Write-Host "  Estimated monthly cost    : ~$estimatedWaste EUR/month" -ForegroundColor $(if($wastedLicenses -gt 0){"Red"}else{"Green"})
+
+# Summary
+Write-Host "`n[*] Inactive Users Summary" -ForegroundColor Cyan
+Write-Host "  Inactive (>$InactiveDays days) : $($inactiveUsers.Count)"
+Write-Host "  Never signed in         : $($neverSignedIn.Count)"
+Write-Host "  Stale guests            : $($staleGuests.Count)"
+Write-Host "  Disabled with licenses  : $(if($disabledLicensed){$disabledLicensed.Count}else{0})"
+Write-Host "  Estimated waste         : ~$estimatedWaste EUR/month"
+Write-Host "  Results exported to     : $ExportPath" -ForegroundColor Cyan
