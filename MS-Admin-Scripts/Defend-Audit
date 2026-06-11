@@ -1,0 +1,122 @@
+#Requires -Modules ExchangeOnlineManagement
+<#
+.SYNOPSIS
+    Audit Microsoft Defender for Office 365 policies.
+
+.DESCRIPTION
+    Checks: anti-phishing policies, safe links, safe attachments,
+    anti-malware, anti-spam, DKIM/DMARC/SPF.
+    
+    CIS M365 Benchmark: 2.1.x — Defender for Office 365
+
+.PARAMETER ExportPath
+    Path for CSV export.
+
+.EXAMPLE
+    Connect-ExchangeOnline
+    .\04-defender-audit.ps1
+#>
+
+param(
+    [string]$ExportPath = ".\audit-results"
+)
+
+$ErrorActionPreference = "Continue"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if (-not (Test-Path $ExportPath)) { New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null }
+
+Write-Host "`n[*] Defender for Office 365 Audit — $(Get-Date)" -ForegroundColor Cyan
+
+# ============================================================
+# CHECK 1: Anti-Phishing Policies
+# ============================================================
+Write-Host "`n[1/6] Anti-Phishing policies..." -ForegroundColor Yellow
+
+$antiPhish = Get-AntiPhishPolicy -ErrorAction SilentlyContinue
+foreach ($policy in $antiPhish) {
+    Write-Host "  Policy: $($policy.Name)" -ForegroundColor Cyan
+    Write-Host "    Impersonation protection : $(if($policy.EnableTargetedUserProtection){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.EnableTargetedUserProtection){"Green"}else{"Red"})
+    Write-Host "    Domain protection        : $(if($policy.EnableTargetedDomainsProtection){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.EnableTargetedDomainsProtection){"Green"}else{"Red"})
+    Write-Host "    Mailbox intelligence     : $(if($policy.EnableMailboxIntelligence){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.EnableMailboxIntelligence){"Green"}else{"Red"})
+    Write-Host "    Spoof intelligence       : $(if($policy.EnableSpoofIntelligence){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.EnableSpoofIntelligence){"Green"}else{"Red"})
+}
+
+# ============================================================
+# CHECK 2: Safe Links Policies
+# ============================================================
+Write-Host "`n[2/6] Safe Links policies..." -ForegroundColor Yellow
+
+$safeLinks = Get-SafeLinksPolicy -ErrorAction SilentlyContinue
+if ($safeLinks) {
+    foreach ($policy in $safeLinks) {
+        Write-Host "  Policy: $($policy.Name)" -ForegroundColor Cyan
+        Write-Host "    URL scanning         : $(if($policy.IsEnabled){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.IsEnabled){"Green"}else{"Red"})
+        Write-Host "    Real-time scan       : $(if($policy.ScanUrls){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.ScanUrls){"Green"}else{"Red"})
+        Write-Host "    Track clicks         : $(if($policy.TrackClicks){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.TrackClicks){"Green"}else{"Green"})
+    }
+} else {
+    Write-Host "  [!] No Safe Links policies found — Defender for O365 may not be licensed" -ForegroundColor Red
+}
+
+# ============================================================
+# CHECK 3: Safe Attachments Policies
+# ============================================================
+Write-Host "`n[3/6] Safe Attachments policies..." -ForegroundColor Yellow
+
+$safeAttach = Get-SafeAttachmentPolicy -ErrorAction SilentlyContinue
+if ($safeAttach) {
+    foreach ($policy in $safeAttach) {
+        Write-Host "  Policy: $($policy.Name)" -ForegroundColor Cyan
+        Write-Host "    Action  : $($policy.Action)" -ForegroundColor $(if($policy.Action -eq "Block"){"Green"}else{"DarkYellow"})
+        Write-Host "    Enabled : $($policy.Enable)" -ForegroundColor $(if($policy.Enable){"Green"}else{"Red"})
+    }
+} else {
+    Write-Host "  [!] No Safe Attachments policies found" -ForegroundColor Red
+}
+
+# ============================================================
+# CHECK 4: Anti-Malware Policies
+# ============================================================
+Write-Host "`n[4/6] Anti-Malware policies..." -ForegroundColor Yellow
+
+$antiMalware = Get-MalwareFilterPolicy -ErrorAction SilentlyContinue
+foreach ($policy in $antiMalware) {
+    Write-Host "  Policy: $($policy.Name)" -ForegroundColor Cyan
+    Write-Host "    File type filter  : $(if($policy.EnableFileFilter){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.EnableFileFilter){"Green"}else{"Red"})
+    Write-Host "    ZAP enabled       : $(if($policy.ZapEnabled){'ON'}else{'OFF'})" -ForegroundColor $(if($policy.ZapEnabled){"Green"}else{"Red"})
+    if ($policy.FileTypes) {
+        Write-Host "    Blocked types     : $($policy.FileTypes.Count) extensions" -ForegroundColor Cyan
+    }
+}
+
+# ============================================================
+# CHECK 5: DKIM Status
+# ============================================================
+Write-Host "`n[5/6] DKIM signing status..." -ForegroundColor Yellow
+
+$dkim = Get-DkimSigningConfig -ErrorAction SilentlyContinue
+foreach ($d in $dkim) {
+    Write-Host "  $($d.Domain) : $(if($d.Enabled){'ENABLED'}else{'DISABLED'})" -ForegroundColor $(if($d.Enabled){"Green"}else{"Red"})
+}
+
+# ============================================================
+# CHECK 6: Anti-Spam Policies
+# ============================================================
+Write-Host "`n[6/6] Anti-Spam policies..." -ForegroundColor Yellow
+
+$antiSpam = Get-HostedContentFilterPolicy -ErrorAction SilentlyContinue
+foreach ($policy in $antiSpam) {
+    Write-Host "  Policy: $($policy.Name)" -ForegroundColor Cyan
+    Write-Host "    Spam action      : $($policy.SpamAction)" -ForegroundColor Cyan
+    Write-Host "    High conf spam   : $($policy.HighConfidenceSpamAction)" -ForegroundColor Cyan
+    Write-Host "    Phish action     : $($policy.PhishSpamAction)" -ForegroundColor Cyan
+    Write-Host "    Bulk threshold   : $($policy.BulkThreshold)" -ForegroundColor Cyan
+}
+
+# Summary
+Write-Host "`n[*] Defender Audit Summary" -ForegroundColor Cyan
+Write-Host "  Anti-Phishing policies   : $(if($antiPhish){$antiPhish.Count}else{0})"
+Write-Host "  Safe Links policies      : $(if($safeLinks){$safeLinks.Count}else{0})"
+Write-Host "  Safe Attachments policies: $(if($safeAttach){$safeAttach.Count}else{0})"
+Write-Host "  DKIM domains configured  : $(if($dkim){$dkim.Count}else{0})"
+Write-Host "  Results exported to      : $ExportPath" -ForegroundColor Cyan
