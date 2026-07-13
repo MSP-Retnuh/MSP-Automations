@@ -1,0 +1,70 @@
+<#
+.SYNOPSIS
+    Exports SharePoint/OneDrive sharing-link creation events from the Purview
+    unified audit log to a CSV report.
+
+.NOTES
+    Requires ExchangeOnlineManagement module + audit log read permissions
+    (Compliance Administrator / Global Admin / eDiscovery Manager role).
+    Install module if needed: Install-Module ExchangeOnlineManagement
+#>
+
+param(
+    [datetime]$StartDate = (Get-Date).AddDays(-90),
+    [datetime]$EndDate   = (Get-Date),
+    [string]$OutputPath  = ".\SharingLinkReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+)
+
+Connect-ExchangeOnline
+
+$operations = @(
+    "SharingLinkCreated",
+    "AnonymousLinkCreated",
+    "SecureLinkCreated",
+    "CompanyLinkCreated",
+    "SharingLinkUpdated",
+    "SharingLinkRemoved",
+    "SharingInvitationCreated"
+)
+
+Write-Host "Querying audit log from $StartDate to $EndDate ..." -ForegroundColor Cyan
+
+$allResults = @()
+$sessionId  = [Guid]::NewGuid().ToString()
+$pageSize   = 5000
+
+do {
+    $batch = Search-UnifiedAuditLog `
+        -StartDate $StartDate `
+        -EndDate $EndDate `
+        -RecordType SharePointSharingOperation `
+        -Operations $operations `
+        -SessionId $sessionId `
+        -SessionCommand ReturnLargeSet `
+        -ResultSize $pageSize
+
+    if ($batch) { $allResults += $batch }
+} while ($batch.Count -eq $pageSize)
+
+Write-Host "Retrieved $($allResults.Count) raw audit records. Parsing..." -ForegroundColor Cyan
+
+$report = foreach ($entry in $allResults) {
+    $data = $entry.AuditData | ConvertFrom-Json
+
+    [PSCustomObject]@{
+        DateUTC        = $data.CreationTime
+        Operation      = $data.Operation
+        UserWhoShared  = $data.UserId
+        SiteUrl        = $data.SiteUrl
+        ItemName       = $data.SourceFileName
+        ItemType       = $data.ItemType
+        LinkScope      = $data.TargetUserOrGroupType   # e.g. Anonymous, Guest, Organization, SpecificUsers
+        LinkTarget     = $data.TargetUserOrGroupName    # recipient(s), if applicable
+        SharingLinkUrl = $data.EventData
+        Workload       = $data.Workload                 # SharePoint or OneDrive
+    }
+}
+
+$report | Sort-Object DateUTC -Descending | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "Done. $($report.Count) sharing events exported to $OutputPath" -ForegroundColor Green
